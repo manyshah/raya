@@ -1,0 +1,234 @@
+name: Build Raya Android Release
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare Flutter source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f "pubspec.yaml" ]; then
+            latest_zip=$(ls -1t raya_flutter*.zip 2>/dev/null | head -n 1 || true)
+
+            if [ -z "$latest_zip" ]; then
+              echo "No pubspec.yaml and no raya_flutter*.zip found."
+              exit 1
+            fi
+
+            mkdir -p _raya_src
+            unzip -q "$latest_zip" -d _raya_src
+
+            inner_pubspec=$(find _raya_src -maxdepth 3 -name pubspec.yaml -print -quit)
+
+            if [ -z "$inner_pubspec" ]; then
+              echo "pubspec.yaml not found inside ZIP."
+              exit 1
+            fi
+
+            src_dir=$(dirname "$inner_pubspec")
+            shopt -s dotglob
+            cp -R "$src_dir"/* .
+          fi
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Get Flutter packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter pub get
+
+      - name: Ensure Android project exists
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -d "android" ]; then
+            flutter create --platforms=android --org com.manyplus --project-name raya .
+          fi
+
+      - name: Prepare release signing files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p android/app
+
+          if [ ! -f "android/app/gamino-release-key.jks" ]; then
+            if [ -f "android_signing/gamino-release-key.jks" ]; then
+              cp android_signing/gamino-release-key.jks android/app/gamino-release-key.jks
+            fi
+          fi
+
+          if [ ! -f "android/key.properties" ]; then
+            if [ -f "android_signing/key.properties" ]; then
+              cp android_signing/key.properties android/key.properties
+            fi
+          fi
+
+          if [ ! -f "android/app/gamino-release-key.jks" ]; then
+            echo "Missing android/app/gamino-release-key.jks"
+            exit 1
+          fi
+
+          if [ ! -f "android/key.properties" ]; then
+            echo "Missing android/key.properties"
+            exit 1
+          fi
+
+          echo "Release signing files found."
+
+      - name: Patch Android package name
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -f "android/app/build.gradle.kts" ]; then
+            sed -i 's/applicationId = ".*"/applicationId = "com.manyplus.raya"/g' android/app/build.gradle.kts || true
+            sed -i 's/namespace = ".*"/namespace = "com.manyplus.raya"/g' android/app/build.gradle.kts || true
+          fi
+
+          if [ -f "android/app/build.gradle" ]; then
+            sed -i 's/applicationId ".*"/applicationId "com.manyplus.raya"/g' android/app/build.gradle || true
+            sed -i 's/namespace ".*"/namespace "com.manyplus.raya"/g' android/app/build.gradle || true
+          fi
+
+      - name: Patch Android release signing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          kts = Path("android/app/build.gradle.kts")
+          groovy = Path("android/app/build.gradle")
+
+          if kts.exists():
+              p = kts
+              s = p.read_text()
+
+              if "keystoreProperties" not in s:
+                  s = "import java.util.Properties\nimport java.io.FileInputStream\n\n" + s
+
+                  s = s.replace(
+                      "plugins {",
+                      """val keystoreProperties = Properties()
+          val keystorePropertiesFile = rootProject.file("key.properties")
+          if (keystorePropertiesFile.exists()) {
+              keystoreProperties.load(FileInputStream(keystorePropertiesFile))
+          }
+
+          plugins {""",
+                      1
+                  )
+
+              if "signingConfigs" not in s or 'create("release")' not in s:
+                  marker = "    buildTypes {"
+                  signing = """    signingConfigs {
+              create("release") {
+                  keyAlias = keystoreProperties["keyAlias"] as String
+                  keyPassword = keystoreProperties["keyPassword"] as String
+                  storeFile = file(keystoreProperties["storeFile"] as String)
+                  storePassword = keystoreProperties["storePassword"] as String
+              }
+          }
+
+          """
+                  s = s.replace(marker, signing + marker, 1)
+
+              s = s.replace(
+                  'signingConfig = signingConfigs.getByName("debug")',
+                  'signingConfig = signingConfigs.getByName("release")'
+              )
+
+              if "isMinifyEnabled = true" in s:
+                  s = s.replace("isMinifyEnabled = true", "isMinifyEnabled = false")
+
+              p.write_text(s)
+
+          elif groovy.exists():
+              p = groovy
+              s = p.read_text()
+
+              if "keystoreProperties" not in s:
+                  prefix = """def keystoreProperties = new Properties()
+          def keystorePropertiesFile = rootProject.file('key.properties')
+          if (keystorePropertiesFile.exists()) {
+              keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
+          }
+
+          """
+                  s = prefix + s
+
+              if "signingConfigs" not in s or "release {" not in s:
+                  marker = "    buildTypes {"
+                  signing = """    signingConfigs {
+              release {
+                  keyAlias keystoreProperties['keyAlias']
+                  keyPassword keystoreProperties['keyPassword']
+                  storeFile file(keystoreProperties['storeFile'])
+                  storePassword keystoreProperties['storePassword']
+              }
+          }
+
+          """
+                  s = s.replace(marker, signing + marker, 1)
+
+              s = s.replace(
+                  "signingConfig signingConfigs.debug",
+                  "signingConfig signingConfigs.release"
+              )
+
+              s = s.replace("minifyEnabled true", "minifyEnabled false")
+
+              p.write_text(s)
+
+          else:
+              raise SystemExit("Android Gradle file not found")
+          PY
+
+      - name: Build release APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter build apk --release --build-name=1.0.0 --build-number=1
+
+      - name: Build release AAB
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter build appbundle --release --build-name=1.0.0 --build-number=1
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: raya-v1-0-0-release-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Upload AAB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: raya-v1-0-0-release-aab
+          path: build/app/outputs/bundle/release/app-release.aab

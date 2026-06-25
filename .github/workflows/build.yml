@@ -61,7 +61,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ ! -d "android" ]; then
+          if [ ! -f "android/app/src/main/AndroidManifest.xml" ]; then
+            rm -rf android
             flutter create --platforms=android --org com.manyplus --project-name raya .
           fi
 
@@ -102,54 +103,92 @@ jobs:
 
           echo "Release signing files found."
 
-      - name: Patch Android package name
+      - name: Force Android network permissions
         shell: bash
         run: |
           set -euo pipefail
 
-          if [ -f "android/app/build.gradle.kts" ]; then
-            sed -i 's/applicationId = ".*"/applicationId = "com.manyplus.raya"/g' android/app/build.gradle.kts || true
-            sed -i 's/namespace = ".*"/namespace = "com.manyplus.raya"/g' android/app/build.gradle.kts || true
-          fi
-
-          if [ -f "android/app/build.gradle" ]; then
-            sed -i 's/applicationId ".*"/applicationId "com.manyplus.raya"/g' android/app/build.gradle || true
-            sed -i 's/namespace ".*"/namespace "com.manyplus.raya"/g' android/app/build.gradle || true
-          fi
-
-      - name: Patch Android release signing
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 <<'PY'
+          python3 <<'PYCODE'
           from pathlib import Path
+          import re
 
-          kts = Path("android/app/build.gradle.kts")
-          groovy = Path("android/app/build.gradle")
+          manifest = Path('android/app/src/main/AndroidManifest.xml')
+          if not manifest.exists():
+              raise SystemExit('AndroidManifest.xml not found')
+
+          s = manifest.read_text(encoding='utf-8')
+
+          s = re.sub(r'\s*<uses-permission\s+android:name="android.permission.INTERNET"\s*/>\s*', '\n', s)
+          s = re.sub(r'\s*<uses-permission\s+android:name="android.permission.ACCESS_NETWORK_STATE"\s*/>\s*', '\n', s)
+
+          m = re.search(r'<manifest\b[^>]*>', s)
+          if not m:
+              raise SystemExit('Opening <manifest> tag not found')
+
+          permissions = '''
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+          '''
+          s = s[:m.end()] + permissions + s[m.end():]
+
+          if '<application' in s and 'android:label=' not in s:
+              s = s.replace('<application', '<application android:label="رایا"', 1)
+
+          manifest.write_text(s, encoding='utf-8')
+          print('----- AndroidManifest.xml after network permission patch -----')
+          print(s)
+          print('------------------------------------------------------------')
+          PYCODE
+
+          grep -q 'android.permission.INTERNET' android/app/src/main/AndroidManifest.xml
+          grep -q 'android.permission.ACCESS_NETWORK_STATE' android/app/src/main/AndroidManifest.xml
+
+      - name: Patch Android package name and release signing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PYCODE'
+          from pathlib import Path
+          import re
+
+          package_name = 'com.manyplus.raya'
+          kts = Path('android/app/build.gradle.kts')
+          groovy = Path('android/app/build.gradle')
 
           if kts.exists():
               p = kts
-              s = p.read_text()
+              s = p.read_text(encoding='utf-8')
 
-              if "keystoreProperties" not in s:
-                  s = "import java.util.Properties\nimport java.io.FileInputStream\n\n" + s
+              if 'import java.util.Properties' not in s:
+                  s = 'import java.util.Properties\nimport java.io.FileInputStream\n\n' + s
 
+              if 'val keystoreProperties = Properties()' not in s:
                   s = s.replace(
-                      "plugins {",
-                      """val keystoreProperties = Properties()
+                      'plugins {',
+                      '''val keystoreProperties = Properties()
           val keystorePropertiesFile = rootProject.file("key.properties")
           if (keystorePropertiesFile.exists()) {
               keystoreProperties.load(FileInputStream(keystorePropertiesFile))
           }
 
-          plugins {""",
+          plugins {''',
                       1
                   )
 
-              if "signingConfigs" not in s or 'create("release")' not in s:
-                  marker = "    buildTypes {"
-                  signing = """    signingConfigs {
+              if 'namespace =' in s:
+                  s = re.sub(r'namespace\s*=\s*"[^"]+"', f'namespace = "{package_name}"', s)
+              else:
+                  s = s.replace('android {', f'android {{\n    namespace = "{package_name}"', 1)
+
+              if 'applicationId =' in s:
+                  s = re.sub(r'applicationId\s*=\s*"[^"]+"', f'applicationId = "{package_name}"', s)
+              else:
+                  s = s.replace('defaultConfig {', f'defaultConfig {{\n        applicationId = "{package_name}"', 1)
+
+              if 'create("release")' not in s:
+                  marker = '    buildTypes {'
+                  signing = '''    signingConfigs {
               create("release") {
                   keyAlias = keystoreProperties["keyAlias"] as String
                   keyPassword = keystoreProperties["keyPassword"] as String
@@ -158,36 +197,41 @@ jobs:
               }
           }
 
-          """
+          '''
                   if marker in s:
                       s = s.replace(marker, signing + marker, 1)
 
-              s = s.replace(
-                  'signingConfig = signingConfigs.getByName("debug")',
-                  'signingConfig = signingConfigs.getByName("release")'
-              )
-
-              s = s.replace("isMinifyEnabled = true", "isMinifyEnabled = false")
-
-              p.write_text(s)
+              s = s.replace('signingConfig = signingConfigs.getByName("debug")', 'signingConfig = signingConfigs.getByName("release")')
+              s = s.replace('isMinifyEnabled = true', 'isMinifyEnabled = false')
+              p.write_text(s, encoding='utf-8')
 
           elif groovy.exists():
               p = groovy
-              s = p.read_text()
+              s = p.read_text(encoding='utf-8')
 
-              if "keystoreProperties" not in s:
-                  prefix = """def keystoreProperties = new Properties()
+              if 'def keystoreProperties = new Properties()' not in s:
+                  prefix = '''def keystoreProperties = new Properties()
           def keystorePropertiesFile = rootProject.file('key.properties')
           if (keystorePropertiesFile.exists()) {
               keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
           }
 
-          """
+          '''
                   s = prefix + s
 
-              if "signingConfigs" not in s or "release {" not in s:
-                  marker = "    buildTypes {"
-                  signing = """    signingConfigs {
+              if 'namespace ' in s:
+                  s = re.sub(r'namespace\s+[\'\"][^\'\"]+[\'\"]', f'namespace "{package_name}"', s)
+              else:
+                  s = s.replace('android {', f'android {{\n    namespace "{package_name}"', 1)
+
+              if 'applicationId ' in s:
+                  s = re.sub(r'applicationId\s+[\'\"][^\'\"]+[\'\"]', f'applicationId "{package_name}"', s)
+              else:
+                  s = s.replace('defaultConfig {', f'defaultConfig {{\n        applicationId "{package_name}"', 1)
+
+              if 'release {' not in s or 'storeFile file(keystoreProperties' not in s:
+                  marker = '    buildTypes {'
+                  signing = '''    signingConfigs {
               release {
                   keyAlias keystoreProperties['keyAlias']
                   keyPassword keystoreProperties['keyPassword']
@@ -196,43 +240,45 @@ jobs:
               }
           }
 
-          """
+          '''
                   if marker in s:
                       s = s.replace(marker, signing + marker, 1)
 
-              s = s.replace(
-                  "signingConfig signingConfigs.debug",
-                  "signingConfig signingConfigs.release"
-              )
-
-              s = s.replace("minifyEnabled true", "minifyEnabled false")
-
-              p.write_text(s)
+              s = s.replace('signingConfig signingConfigs.debug', 'signingConfig signingConfigs.release')
+              s = s.replace('minifyEnabled true', 'minifyEnabled false')
+              p.write_text(s, encoding='utf-8')
 
           else:
-              raise SystemExit("Android Gradle file not found")
-          PY
+              raise SystemExit('Android Gradle file not found')
+          PYCODE
+
+      - name: Clean before release build
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter clean
+          flutter pub get
 
       - name: Build release APK
         shell: bash
         run: |
           set -euo pipefail
-          flutter build apk --release --build-name=1.0.5 --build-number=6
+          flutter build apk --release --build-name=1.0.6 --build-number=7
 
       - name: Build release AAB
         shell: bash
         run: |
           set -euo pipefail
-          flutter build appbundle --release --build-name=1.0.5 --build-number=6
+          flutter build appbundle --release --build-name=1.0.6 --build-number=7
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: raya-v1-0-5-release-apk
+          name: raya-v1-0-6-release-apk
           path: build/app/outputs/flutter-apk/app-release.apk
 
       - name: Upload AAB artifact
         uses: actions/upload-artifact@v4
         with:
-          name: raya-v1-0-5-release-aab
+          name: raya-v1-0-6-release-aab
           path: build/app/outputs/bundle/release/app-release.aab

@@ -3,7 +3,9 @@ name: Build Raya Android Release
 on:
   workflow_dispatch:
   push:
-    branches: [ main, master ]
+    branches:
+      - main
+      - master
 
 jobs:
   build:
@@ -26,10 +28,11 @@ jobs:
               exit 1
             fi
 
+            rm -rf _raya_src
             mkdir -p _raya_src
             unzip -q "$latest_zip" -d _raya_src
 
-            inner_pubspec=$(find _raya_src -maxdepth 3 -name pubspec.yaml -print -quit)
+            inner_pubspec=$(find _raya_src -maxdepth 5 -name pubspec.yaml -print -quit)
 
             if [ -z "$inner_pubspec" ]; then
               echo "pubspec.yaml not found inside ZIP."
@@ -53,12 +56,6 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Get Flutter packages
-        shell: bash
-        run: |
-          set -euo pipefail
-          flutter pub get
-
       - name: Ensure Android project exists
         shell: bash
         run: |
@@ -67,6 +64,12 @@ jobs:
           if [ ! -d "android" ]; then
             flutter create --platforms=android --org com.manyplus --project-name raya .
           fi
+
+      - name: Get Flutter packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter pub get
 
       - name: Prepare release signing files
         shell: bash
@@ -156,15 +159,15 @@ jobs:
           }
 
           """
-                  s = s.replace(marker, signing + marker, 1)
+                  if marker in s:
+                      s = s.replace(marker, signing + marker, 1)
 
               s = s.replace(
                   'signingConfig = signingConfigs.getByName("debug")',
                   'signingConfig = signingConfigs.getByName("release")'
               )
 
-              if "isMinifyEnabled = true" in s:
-                  s = s.replace("isMinifyEnabled = true", "isMinifyEnabled = false")
+              s = s.replace("isMinifyEnabled = true", "isMinifyEnabled = false")
 
               p.write_text(s)
 
@@ -194,7 +197,8 @@ jobs:
           }
 
           """
-                  s = s.replace(marker, signing + marker, 1)
+                  if marker in s:
+                      s = s.replace(marker, signing + marker, 1)
 
               s = s.replace(
                   "signingConfig signingConfigs.debug",
@@ -213,22 +217,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          flutter build apk --release --build-name=1.0.0 --build-number=1
+          flutter build apk --release --build-name=1.0.5 --build-number=6
 
       - name: Build release AAB
         shell: bash
         run: |
           set -euo pipefail
-          flutter build appbundle --release --build-name=1.0.0 --build-number=1
+          flutter build appbundle --release --build-name=1.0.5 --build-number=6
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: raya-v1-0-0-release-apk
+          name: raya-v1-0-5-release-apk
           path: build/app/outputs/flutter-apk/app-release.apk
 
       - name: Upload AAB artifact
         uses: actions/upload-artifact@v4
         with:
-          name: raya-v1-0-0-release-aab
+          name: raya-v1-0-5-release-aab
           path: build/app/outputs/bundle/release/app-release.aab
